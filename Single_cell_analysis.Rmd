@@ -1,0 +1,474 @@
+---
+title: "scRNA_analysis"
+author: "Kiran Adhikari"
+date: "7/21/2025"
+output:
+  github_document
+---
+
+##### Load required libraries
+```{r load-libs, warning=FALSE, message=FALSE}
+library(Seurat)
+library(tidyverse)
+library(clustree)
+library(celldex)
+library(SingleR)
+library(pheatmap)
+library(edgeR)
+library(limma)
+```
+
+
+
+##### Create a datadirs object specifying paths of count directories for each sample
+```{r}
+datadirs <- c(PBMMC1 = "./Data/PBMMC-1/",
+              PBMMC2 = "./Data/PBMMC-2/",
+              PBMMC3 = "./Data/PBMMC-3/")
+datadirs
+#data_list <- lapply(datadirs, Read10X)
+```
+
+
+
+##### Load the dataset and generate a sparse matrix
+```{r}
+Data_sparse_matrix <- Read10X(data.dir = datadirs)
+```
+
+
+##### Creating seurat object from sparse matrix keeping genes that are expressed in at least 3 cells and cells that have atleast 100 genes/features.
+```{r}
+Data_seurat.object <- CreateSeuratObject(counts = Data_sparse_matrix, project = "PBMMC", min.cells = 3, min.features = 100)
+str(Data_seurat.object)
+```
+
+
+
+#### Quality control
+##### Mitochondrial genes
+```{r}
+Data_seurat.object <- PercentageFeatureSet(Data_seurat.object, pattern = "^MT-", col.name = "percent.mt")
+```
+
+##### Ribosomal genes
+```{r}
+Data_seurat.object <- PercentageFeatureSet(Data_seurat.object, pattern = "^RP[SL]", col.name = "percent.ribo")
+```
+
+
+##### Hemoglobin genes (but not HBP)
+```{r}
+Data_seurat.object <- PercentageFeatureSet(Data_seurat.object, pattern = "^HB[^(P)]", col.name = "percent.globin")
+head(Data_seurat.object@meta.data)
+```
+
+
+
+
+##### Visualzing these features as violin plots
+```{r}
+VlnPlot(Data_seurat.object, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+```
+
+
+
+##### Plotting two features together
+```{r}
+FeatureScatter(Data_seurat.object, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + geom_smooth(method = 'lm')
+```
+
+
+
+##### Plotting mitochondrial, ribosomal, and globin genes
+```{r}
+VlnPlot(Data_seurat.object, features = c("percent.mt", "percent.ribo", "percent.globin"))
+```
+
+
+##### PBMMC-2 has loq ribosomal counts and high globin counts. Seems they have a strong negative correlation suggesting presence of erythrocytes
+```{r}
+FeatureScatter(Data_seurat.object, feature1 = "percent.globin", feature2 = "percent.ribo")
+```
+
+
+
+
+##### Filtering cells based on the paper i.e. >200 features per cell, <8% of mitochondrial counts. Also filtering out cells that have >5000 detected features/cell to remove possible doublets
+```{r}
+Data_seurat.object<- subset(Data_seurat.object, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 8)
+Data_seurat.object
+```
+
+
+
+##### Visualizing data again to make sure the filters worked properly
+```{r}
+VlnPlot(Data_seurat.object, features = c("nFeature_RNA", "percent.mt"))
+```
+
+
+
+##### Normalizing the data with default LogNormalize and scale factor of 1e4
+```{r}
+Data_seurat.object<- NormalizeData(Data_seurat.object) 
+```
+
+
+
+##### Identify highly variable features
+```{r}
+Data_seurat.object<- FindVariableFeatures(Data_seurat.object, selection.method = "vst", nfeatures = 2000)
+```
+
+
+
+
+##### Identify the top 10 variable features and plot them
+```{r}
+top10<- head(VariableFeatures(Data_seurat.object), 10)
+top10
+VF_Plot<- VariableFeaturePlot(Data_seurat.object)
+LabelPoints(plot = VF_Plot, points = top10, repel = TRUE)
+```
+
+
+
+
+
+##### Scaling (Linear transformation) the data to remove any sort of biases in sample collection or processing. This shifts expression of each gene such that mean expression across all cells is 0 Scales the expression of each gene such that variance across all cells is 1. This makes sure that highly DE genes do not dominate downstream analysis
+```{r}
+Data_seurat.object <- ScaleData(Data_seurat.object, features = rownames(Data_seurat.object))
+```
+
+
+
+
+
+##### Perform Linear dimensionality reduction (PCA) and visualize
+```{r}
+Data_seurat.object <- RunPCA(Data_seurat.object)
+DimPlot(Data_seurat.object, reduction = "pca")
+```
+
+##### Generating heat map (for first 6 PCs) based on PC scores calculated
+```{r}
+DimHeatmap(Data_seurat.object, dims = 1:6, cells = 500, balanced = TRUE)
+```
+
+
+
+##### Generating elbowplot to determine number of PCs for downstream analysis
+```{r}
+ElbowPlot(Data_seurat.object, ndims = 40)
+```
+
+
+
+##### The elbow appears to be around 25 and we will be using 25 dimensions for downstream analysis
+```{r}
+Data_seurat.object <- RunUMAP(Data_seurat.object, dims = 1:25)
+DimPlot(Data_seurat.object, reduction = "umap")
+```
+
+
+
+##### We can see that cells from different samples are clustered together but also there is some kind of separation within clusters. So we will perform integration. For which, we will first split the object by sample. We then do a log normalization, and identify variable features individually for each dataset using 'vst'
+
+```{r}
+Data_list <- SplitObject(Data_seurat.object, split.by = "orig.ident")
+
+for (i in 1: length (Data_list)) {
+  Data_list[[i]] <- NormalizeData(Data_list[[i]])
+  Data_list[[i]] <- FindVariableFeatures(Data_list[[i]], selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+}
+```
+
+
+##### Preparing for integration by selecting integration anchors
+```{r}
+Data_anchors <- FindIntegrationAnchors(Data_list, dims = 1:25)
+```
+
+
+
+
+##### Performing integration
+```{r}
+Data_int <- IntegrateData(Data_anchors, dims = 1:25)
+```
+
+
+
+
+##### Now switch the deafult 'Assay' to 'Integrated' got clustering and visualization
+```{r}
+DefaultAssay(Data_int) <- "integrated"
+```
+
+
+
+
+##### Performing the scaling, PCA, and UMAP on integrated data
+```{r}
+Data_int <- ScaleData(Data_int)
+Data_int <- RunPCA(Data_int, npcs = 30)
+Data_int <- RunUMAP(Data_int, reduction = "pca", dims = 1:25)
+DimPlot(Data_int, reduction = "umap")
+```
+
+
+
+
+##### Clustering the integrated data
+```{r}
+Data_int <- FindNeighbors(Data_int, dims = 1:25)
+```
+
+
+
+##### Assigning the cells to clusters
+```{r}
+Data_int <- FindClusters(Data_int, resolution = seq(0.1, 0.8, by = 0.1))
+head(Data_int@meta.data)
+```
+
+
+
+
+##### View how clusters sub-divide at increasing resolution
+```{r}
+
+clustree(Data_int@meta.data[, grep("integrated_snn_res", colnames(Data_int@meta.data))], prefix = "integrated_snn_res.")
+```
+
+
+
+
+##### UMAP coloring each cell according to a cluster id
+```{r}
+DimPlot(Data_int, group.by = "integrated_snn_res.0.3")
+```
+
+
+
+
+#### Cell annotation
+
+##### Since clustering at a resolution of 0.3 provided most sensible results, we will set the identity of each cell based on this clustering
+
+```{r}
+Data_int <- SetIdent(Data_int, value = Data_int$integrated_snn_res.0.3)
+```
+
+
+
+
+##### Now we will use original data count and not the integrated data for cell annotation
+```{r}
+DefaultAssay(Data_int) <- "RNA"
+```
+
+
+
+##### Visualing expression of a gene in cluster based on the UMAP generated
+```{r}
+FeaturePlot(Data_int, "HBA1")
+```
+
+
+
+##### Manual cell type annotation can be done as well. For example for t cell genes
+```{r}
+tcell_genes <- c("IL7R", "LTB", "TRAC", "CD3D")
+FeaturePlot(Data_int, tcell_genes, ncol = 2)
+```
+
+
+##### t-cell genes seem to be present in cluster 0 and 8 and we can make sure by plotting them in violin plots
+```{r}
+VlnPlot(Data_int, tcell_genes, ncol = 2)
+```
+
+
+
+##### Automating with AddModuleScore
+```{r}
+Data_int <- AddModuleScore(Data_int, features=list(tcell_genes), name = "tcell_genes")
+head(Data_int@meta.data)
+```
+
+##### Plotting UMAP based on the new column generated on previous step
+```{r}
+FeaturePlot(Data_int, "tcell_genes1")
+```
+
+
+
+
+##### We can plot a violin plot as well
+```{r}
+VlnPlot(Data_int, "tcell_genes1")
+```
+
+
+
+
+##### Annotating cells according to cell cycling phase. First extracting the built-in genes
+```{r}
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+```
+
+
+
+
+##### Now running the function and visualizing the annotations
+```{r}
+Data_int <- CellCycleScoring(Data_int, s.features = s.genes, g2m.features = g2m.genes)
+DimPlot(Data_int, group.by = "Phase")
+```
+
+
+
+
+##### Cell type annotation using SingleR requires a reference dataset of primary cells. scRNA package has many reference datasets. Here we are using a reference dataset from celldex.
+```{r}
+ref <- celldex::NovershternHematopoieticData()
+class(ref)
+table(ref$label.main)
+```
+
+
+
+
+##### Comparing normalized count data to a reference set using SingleR
+```{r}
+Data_int_SingleR <- SingleR(test = Seurat::GetAssayData(Data_int, slot = "data"), ref = ref, labels = ref$label.main)
+head(Data_int_SingleR)
+```
+
+
+
+##### Visualizing SingleR score quality scores
+```{r}
+
+SingleR::plotScoreHeatmap(Data_int_SingleR)
+```
+
+
+
+```{r}
+plotDeltaDistribution(Data_int_SingleR)
+```
+
+
+##### Some annotations contain limited number of cells. So, removing them from annotation
+```{r}
+singleR_labels <- Data_int_SingleR$labels
+t <- table(singleR_labels)
+other <- names(t)[t < 10]
+singleR_labels[singleR_labels %in% other] <- "None"
+```
+
+
+
+##### for Visualizing in UMAP, first annotation is added to meta data and then plotting it
+```{r}
+library(dittoSeq)
+Data_int$SingleR_annot <- singleR_labels
+dittoDimPlot(Data_int, "SingleR_annot", size = 0.7)
+```
+
+
+
+##### Check for number of cells per sample for each annotated cell type
+```{r}
+dittoBarPlot(Data_int, var = "SingleR_annot", group.by = "orig.ident")
+```
+
+
+
+##### Visualizing the cell types based on cluster
+```{r}
+dittoBarPlot(Data_int, var = "SingleR_annot", group.by = "integrated_snn_res.0.3")
+```
+##### From the above plot we can see that clusters 0 and 8 contain cells annotated as T cells (CD4+ and CD8+).
+
+
+
+#### Differential gene expression
+##### Finding markers for each cluster by testing genes that are expressed in atleast 25% of cells in either group and upregulated in each cluster
+```{r}
+DE_genes <- FindAllMarkers(Data_int, min.pct = 0.25, only.pos = TRUE)
+```
+
+
+
+
+##### Subsetting the table to keep only the significant genes
+```{r}
+DE_sig <- subset(DE_genes, DE_genes$p_val_adj < 0.05)
+#write.csv(DE_sig, "Significant_markers.csv", row.names = F, quote = F)
+top_specific_markers <- DE_sig %>% group_by(cluster) %>% top_n(3, avg_log2FC)
+```
+
+
+
+
+##### Generating dotplot of top markers
+```{r}
+dittoDotPlot(Data_int, vars = unique(top_specific_markers$gene), group.by = "integrated_snn_res.0.3")
+```
+
+
+##### Checking to see if the T cell genes are among the significant marker genes
+```{r}
+DE_sig[DE_sig$gene %in% tcell_genes,]
+```
+
+##### The table above shows some of the T-cell genes are highly significant markers for Clusters 0 and 8.
+
+
+
+
+##### Differential expression between groups of cells (between clusters or specific cell types). First setting the default cell identity to cell types defined by Single R
+
+```{r}
+Data_int <- SetIdent(Data_int, value = "SingleR_annot")
+```
+
+
+
+
+##### Now running the differential expression analysis and subsetting the table to keep significant genes
+```{r}
+DE_cd8_cd4 <- FindMarkers(Data_int, 
+                          ident.1 = "CD8+ T cells",
+                          ident.2 = "CD4+ T cells",
+                          group.by = Data_int$SingleR_annot,
+                          test.use = "wilcox")
+DE_cd8_cd4_sig <- subset(DE_cd8_cd4, DE_cd8_cd4$p_val_adj < 0.05)
+```
+
+
+
+##### To check for the expression CD8A, CD8B, and CD8B in CD cell types
+```{r}
+view(DE_cd8_cd4_sig)
+DE_cd8_cd4[c("CD4", "CD8A", "CD8B"),]
+```
+
+##### Positive log fold change for CD8 cells represent higher expression in CD8+ T-cells than in CD4+ T-cells. We can view the same thing in a plot.
+
+
+```{r}
+VlnPlot(Data_int, features = c("CD4", "CD8A", "CD8B"), idents = c("CD8+ T cells", "CD4+ T cells"))
+```
+
+
+
+```{r}
+sessionInfo()
+```
+
